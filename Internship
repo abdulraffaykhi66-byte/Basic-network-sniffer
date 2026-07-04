@@ -1,0 +1,191 @@
+from scapy.all import sniff, conf
+from scapy.layers.inet import IP, TCP, UDP, ICMP
+from scapy.layers.l2 import Ether, ARP
+from scapy.layers.dns import DNS, DNSQR, DNSRR
+from scapy.layers.http import HTTP, HTTPRequest, HTTPResponse
+from datetime import datetime
+import argparse
+import sys
+ 
+ 
+
+RED    = "\033[91m"
+GREEN  = "\033[92m"
+YELLOW = "\033[93m"
+CYAN   = "\033[96m"
+BOLD   = "\033[1m"
+RESET  = "\033[0m"
+ 
+def color(text, code):
+    return f"{code}{text}{RESET}"
+ 
+ 
+
+stats = {"total": 0, "TCP": 0, "UDP": 0, "ICMP": 0, "ARP": 0, "DNS": 0, "HTTP": 0, "OTHER": 0}
+ 
+def analyze_packet(packet):
+    stats["total"] += 1
+    timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+ 
+    print(color(f"\n{'═'*65}", BOLD))
+    print(color(f"  Packet #{stats['total']}  |  {timestamp}", BOLD))
+    print(color(f"{'═'*65}", BOLD))
+ 
+    if packet.haslayer(Ether):
+        eth = packet[Ether]
+        print(color("  [Ethernet / Layer 2]", CYAN))
+        print(f"    Src MAC : {eth.src}")
+        print(f"    Dst MAC : {eth.dst}")
+        print(f"    Type    : 0x{eth.type:04X}")
+ 
+
+    if packet.haslayer(ARP):
+        stats["ARP"] += 1
+        arp = packet[ARP]
+        op = "Request" if arp.op == 1 else "Reply"
+        print(color("  [ARP]", YELLOW))
+        print(f"    Operation : {op}")
+        print(f"    Sender IP : {arp.psrc}  ({arp.hwsrc})")
+        print(f"    Target IP : {arp.pdst}  ({arp.hwdst})")
+        return  # ARP has no IP layer
+ 
+    
+    if packet.haslayer(IP):
+        ip = packet[IP]
+        proto_name = {1: "ICMP", 6: "TCP", 17: "UDP"}.get(ip.proto, str(ip.proto))
+        print(color("  [IP / Layer 3]", GREEN))
+        print(f"    Src IP  : {ip.src}")
+        print(f"    Dst IP  : {ip.dst}")
+        print(f"    Protocol: {proto_name}  |  TTL: {ip.ttl}  |  Len: {ip.len} bytes")
+        print(f"    ID      : {ip.id}  |  Flags: {ip.flags}  |  Checksum: {hex(ip.chksum)}")
+ 
+
+        if packet.haslayer(TCP):
+            stats["TCP"] += 1
+            tcp = packet[TCP]
+            flags = decode_tcp_flags(tcp.flags)
+            print(color("  [TCP / Layer 4]", YELLOW))
+            print(f"    Src Port : {tcp.sport}   Dst Port : {tcp.dport}")
+            print(f"    Flags    : {flags}")
+            print(f"    Seq      : {tcp.seq}    Ack: {tcp.ack}")
+            print(f"    Win Size : {tcp.window}")
+ 
+            
+            if packet.haslayer(HTTPRequest):
+                stats["HTTP"] += 1
+                req = packet[HTTPRequest]
+                print(color("  [HTTP Request]", RED))
+                print(f"    Method  : {req.Method.decode()}")
+                print(f"    Host    : {req.Host.decode() if req.Host else 'N/A'}")
+                print(f"    Path    : {req.Path.decode()}")
+            elif packet.haslayer(HTTPResponse):
+                stats["HTTP"] += 1
+                res = packet[HTTPResponse]
+                print(color("  [HTTP Response]", RED))
+                print(f"    Status  : {res.Status_Code.decode()}")
+ 
+        
+        elif packet.haslayer(UDP):
+            stats["UDP"] += 1
+            udp = packet[UDP]
+            print(color("  [UDP / Layer 4]", YELLOW))
+            print(f"    Src Port : {udp.sport}   Dst Port : {udp.dport}")
+            print(f"    Length   : {udp.len} bytes")
+ 
+          
+            if packet.haslayer(DNS):
+                stats["DNS"] += 1
+                dns = packet[DNS]
+                print(color("  [DNS]", RED))
+                if dns.qr == 0 and dns.qdcount > 0:          # Query
+                    qname = dns[DNSQR].qname.decode().rstrip(".")
+                    print(f"    Query  : {qname}")
+                elif dns.qr == 1 and dns.ancount > 0:         # Response
+                    ans = dns[DNSRR]
+                    print(f"    Answer : {ans.rdata}")
+ 
+    
+        elif packet.haslayer(ICMP):
+            stats["ICMP"] += 1
+            icmp = packet[ICMP]
+            icmp_types = {0: "Echo Reply", 8: "Echo Request", 3: "Dest Unreachable", 11: "TTL Exceeded"}
+            print(color("  [ICMP]", YELLOW))
+            print(f"    Type : {icmp_types.get(icmp.type, icmp.type)}  |  Code: {icmp.code}")
+ 
+        else:
+            stats["OTHER"] += 1
+ 
+    
+    if packet.haslayer("Raw"):
+        raw = bytes(packet["Raw"])
+        preview = raw[:80]
+        printable = "".join(chr(b) if 32 <= b < 127 else "." for b in preview)
+        print(color("  [Payload Preview]", CYAN))
+        print(f"    {printable}")
+ 
+ 
+def decode_tcp_flags(flags):
+    names = {0x01: "FIN", 0x02: "SYN", 0x04: "RST", 0x08: "PSH",
+             0x10: "ACK", 0x20: "URG", 0x40: "ECE", 0x80: "CWR"}
+    return " | ".join(v for k, v in names.items() if int(flags) & k) or "NONE"
+ 
+ 
+
+def print_summary():
+    print(color(f"\n{'═'*65}", BOLD))
+    print(color("  CAPTURE SUMMARY", BOLD))
+    print(color(f"{'═'*65}", BOLD))
+    for key, val in stats.items():
+        bar = "█" * (val * 20 // max(stats["total"], 1))
+        print(f"  {key:<8}: {val:>5}  {color(bar, GREEN)}")
+    print()
+ 
+ 
+
+def main():
+    parser = argparse.ArgumentParser(description="Network Packet Analyzer")
+    parser.add_argument("-i", "--iface",   default=None,  help="Network interface (e.g. eth0, Wi-Fi)")
+    parser.add_argument("-c", "--count",   type=int, default=20, help="Number of packets to capture (0 = infinite)")
+    parser.add_argument("-f", "--filter",  default="",    help='BPF filter (e.g. "tcp port 80")')
+    parser.add_argument("--list-ifaces",   action="store_true", help="List available interfaces and exit")
+    args = parser.parse_args()
+ 
+    if args.list_ifaces:
+        print(color("\nAvailable Interfaces:", BOLD))
+        for iface in conf.ifaces.keys():
+            print(f"  • {iface}")
+        sys.exit(0)
+ 
+    iface_msg = args.iface or "default"
+    filter_msg = args.filter or "all traffic"
+    count_msg  = str(args.count) if args.count else "∞"
+ 
+    print(color(f"""
+╔══════════════════════════════════════════════╗
+║       Network Packet Analyzer  v1.0          ║
+╚══════════════════════════════════════════════╝
+  Interface : {iface_msg}
+  Filter    : {filter_msg}
+  Count     : {count_msg} packets
+""", BOLD))
+ 
+    try:
+        sniff(
+            iface=args.iface,
+            filter=args.filter,
+            count=args.count,
+            prn=analyze_packet,
+            store=False
+        )
+    except KeyboardInterrupt:
+        print(color("\n  [!] Capture stopped by user.", YELLOW))
+    except PermissionError:
+        print(color("\n  [!] Permission denied — run with sudo (Linux/Mac) or as Administrator (Windows).", RED))
+        sys.exit(1)
+    finally:
+        print_summary()
+ 
+ 
+if __name__ == "__main__":
+    main()
+ 
