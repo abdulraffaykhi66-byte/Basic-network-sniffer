@@ -1,2 +1,2 @@
 # Basic-network-sniffer
-prject for internship
+project for internship
